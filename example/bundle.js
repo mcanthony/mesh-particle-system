@@ -44,6 +44,7 @@ function setupParticles(scene) {
   mps.setColorRange( col3.Red(), col3.Green() );
   mps.setSizeRange( 1, 0.5 );
   mps.mesh.position.y = 2;
+  // or: mps.parent = someOtherMesh
 
   mps.initParticle = function myInitParticle(pdata) {
     pdata.position.x = Math.random() * 2 - 1;
@@ -56,7 +57,7 @@ function setupParticles(scene) {
     pdata.age = 0;
     pdata.lifetime =   Math.random() * 2 + 1;
   }
-
+  
   mps.start();
   window.mps = mps;
   window.scene = scene
@@ -163,6 +164,8 @@ function MeshParticleSystem(capacity, rate, texture, scene) {
   this.texture = texture;
   this.gravity = -1;
   this.disposeOnEmpty = false;
+  this.stopOnEmpty = false;
+  this.parent = null;
 
   // internal
   this._scene = scene;
@@ -176,7 +179,10 @@ function MeshParticleSystem(capacity, rate, texture, scene) {
   this._size1 = 1.0;
   this._positions = [];
   this._colors = [];
+  this._playing = false;
   this._disposed = false;
+  this._lastPos = vec3.Zero();
+  this._startingThisFrame = false;
 
   // init mesh and vertex data
   var positions = this._positions;
@@ -230,13 +236,18 @@ var MPS = MeshParticleSystem;
 
 
 MPS.prototype.start = function startMPS() {
+  if (this._playing) return;
   if (this._disposed) throw new Error('Already disposed');
   this._scene.registerBeforeRender( this.curriedAnimate );
-  recalculateBounds(this)
+  recalculateBounds(this);
+  this._playing = true;
+  this._startingThisFrame = true;
 };
 
-MPS.prototype.stop = function endMPS() {
+MPS.prototype.stop = function stopMPS() {
+  if (!this._playing) return;
   this._scene.unregisterBeforeRender( this.curriedAnimate );
+  this._playing = false;
 };
 
 MPS.prototype.setAlphaRange = function setAlphas(from, to) {
@@ -261,7 +272,7 @@ MPS.prototype.setSizeRange = function setSizes(from, to) {
 };
 
 MPS.prototype.emit = function mpsEmit(count) {
-  if (this._disposed) throw new Error('Already disposed');
+  this.start();
   spawnParticles(this, count);
 };
 
@@ -380,6 +391,9 @@ function removeParticle(sys, n) {
 MPS.prototype.animate = function animateSPS(dt) {
   if (dt > 0.1) dt = 0.1;
 
+  // adjust particles if mesh has moved
+  adjustParticlesForMovement(this)
+  
   // add/update/remove particles
   spawnParticles(this, this.rate * dt)
   updateAndRecycle(this, dt)
@@ -390,10 +404,11 @@ MPS.prototype.animate = function animateSPS(dt) {
 
   // only draw active mesh positions
   this.mesh.subMeshes[0].indexCount = this._alive*6
-  
-  // possibly self-dispose if no active particles are left
-  if (this.disposeOnEmpty && (this._alive===0)) {
-    this.dispose()
+
+  // possibly stop/dispose if no rate and no living particles
+  if (this._alive===0 && this.rate===0) {
+    if (this.disposeOnEmpty) this.dispose();
+    else if (this.stopOnEmpty) this.stop();
   }
 };
 
@@ -432,16 +447,46 @@ function updateAndRecycle(system, dt) {
 }
 
 
+// if mesh system has moved since last frame, adjust particles to compensate
+
+function adjustParticlesForMovement(system) {
+  // relocate to parent if needed
+  if (system.parent) {
+    var p = system.parent.absolutePosition;
+    if (system._startingThisFrame) {
+      // bug workaround: on first frame parent may be newly created
+      p = system.parent.getAbsolutePosition();
+      system._startingThisFrame = false;
+    }
+    system.mesh.position.copyFrom(p)
+  }
+  var dx = system.mesh.position.x - system._lastPos.x;
+  var dy = system.mesh.position.y - system._lastPos.y;
+  var dz = system.mesh.position.z - system._lastPos.z;
+  system._lastPos.copyFrom( system.mesh.position );
+  if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) < .001) return;
+    
+  var alive = system._alive;
+  var data = system._data;
+  for (var i=0; i<alive; i++) {
+    var di = i*9;
+    data[di]   -= dx;
+    data[di+1] -= dy;
+    data[di+2] -= dz;
+  }
+}
+
+
 function updatePositionsData(system) {
   var positions = system._positions;
   var data = system._data;
   var cam = system._scene.activeCamera;
 
   // prepare transform
-  var eye = cam.globalPosition;
-  var tgt = system.mesh.getAbsolutePosition();
   var mat = BABYLON.Matrix.Identity();
-  BABYLON.Matrix.LookAtLHToRef(eye, tgt, vec3.Up(), mat);
+  BABYLON.Matrix.LookAtLHToRef(cam.globalPosition,      // eye
+                               system.mesh.position,    // target
+                               vec3.Up(), mat);
   mat.m[12] = mat.m[13] = mat.m[14] = 0;
   mat.invert();
   var m = mat.m
@@ -461,10 +506,10 @@ function updatePositionsData(system) {
 
       var vx = (pt===1 || pt===2) ? size : -size;
       var vy = (pt>1) ? size : -size;
-
+      
       // following is unrolled version of Vector3.TransformCoordinatesToRef
       // minus the bits zeroed out due to having no z coord
-
+      
       var w = (vx * m[3]) + (vy * m[7]) + m[15];
       positions[idx]   = data[di]   + (vx * m[0] + vy * m[4])/w;
       positions[idx+1] = data[di+1] + (vx * m[1] + vy * m[5])/w;
@@ -522,18 +567,27 @@ function updateColorsArray(system) {
 
 function disposeMPS(system) {
   system.stop();
+  system.material.ambientTexture = null;
+  system.material.opacityTexture = null;
+  system.material.diffuseTexture = null;
   system.material.dispose();
   system.material = null;
+  system.mesh.geometry.dispose();
   system.mesh.dispose();
   system.mesh = null;
   system.texture = null;
+  system.curriedAnimate = null;
+  system.initParticle = null;
   system._scene = null;
   system._dummyParticle = null;
   system._color0 = null;
   system._color1 = null;
-  system._data.length = 0;
+  system._data = null;
   system._positions.length = 0;
   system._colors.length = 0;
+  system._positions = null;
+  system._colors = null;
+  system.parent = null;
   system._disposed = true;
 }
 
